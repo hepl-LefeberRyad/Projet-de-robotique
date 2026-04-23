@@ -1,0 +1,289 @@
+#include <QTRSensors.h>          // Library for line sensors
+#include <NewPing.h>             // Library for ultrasonic sensors
+#include <JQ6500_Serial.h>       // Library for MP3 module
+#include <Servo.h>               // Library for servo motors
+
+const int PIN_SERVO_1 = 11;      // Pin for servo 1
+const int PIN_SERVO_2 = 12;      // Pin for servo 2
+
+Servo servo1;                    // Create servo 1 object
+Servo servo2;                    // Create servo 2 object
+
+QTRSensors qtr;                  // Create QTR sensor object
+
+const uint8_t SensorCount = 3;   // Number of line sensors
+uint16_t sensorValues[3];        // Array to store sensor readings
+
+// millis
+unsigned long mp3Timer = 0;      // Timer for MP3 playback
+bool mp3Busy = false;            // Indicates if MP3 is playing
+uint16_t currentTrack = 0;       // Current track number
+unsigned long mp3Duration = 0;   // Duration of current track
+
+// --- Speed-based blinking LED ---
+#define LED_PIN 13               // LED pin
+unsigned long ledTimer = 0;      // Timer for LED blinking
+bool ledState = false;           // LED ON/OFF state
+unsigned long blinkInterval = 500; // Blink interval in ms
+
+// Motor pins
+#define IN1L 5                   // Left motor pin 1
+#define IN2L 6                   // Left motor pin 2
+#define IN1R 9                   // Right motor pin 1
+#define IN2R 10                  // Right motor pin 2
+#define WHITE_THRESHOLD 200      // Threshold to detect white surface
+
+bool audioPlayed = false;        // Prevents repeated audio playback
+
+int baseSpeed = 65;              // Base speed of robot
+int maxSpeed = 255;              // Maximum motor speed
+
+// PID constants
+float Kp = 0.2;                 // Proportional gain
+float Ki = 0.0;                 // Integral gain
+float Kd = 0.41;                // Derivative gain
+
+int lastError = 0;              // Previous error value
+int integral = 0;               // Integral sum
+
+unsigned long turnDelay = 1600; // Duration for 180° turn
+
+enum RobotState {               // Robot states
+  BEFORE_TURN,                 // Before first white line
+  AFTER_TURN,                  // After turning
+  DONE                         // Finished state
+};
+
+RobotState state = BEFORE_TURN; // Initial state
+
+// --- Ultrasonic sensors ---
+#define TRIG1 22                // Trigger pin sensor 1
+#define ECHO1 24                // Echo pin sensor 1
+#define TRIG2 26                // Trigger pin sensor 2
+#define ECHO2 28                // Echo pin sensor 2
+#define MAX_DISTANCE 30         // Max detection distance (cm)
+#define SEUIL_OBJET 8           // Object detection threshold
+
+NewPing sonar1(TRIG1, ECHO1, MAX_DISTANCE); // Ultrasonic sensor 1
+NewPing sonar2(TRIG2, ECHO2, MAX_DISTANCE); // Ultrasonic sensor 2
+
+JQ6500_Serial mp3(Serial1);     // MP3 module on Serial1
+
+void setup() {
+  Serial.begin(9600);          // Start serial communication
+  Serial1.begin(9600);         // Start MP3 serial communication
+
+  servo1.attach(PIN_SERVO_1);  // Attach servo 1
+  servo2.attach(PIN_SERVO_2);  // Attach servo 2
+
+  servo1.write(130);           // Set initial position servo 1
+  delay(500);                  // Wait 500 ms
+
+  servo2.write(40);            // Set initial position servo 2
+  delay(500);                  // Wait 500 ms
+
+  mp3.setVolume(30);           // Set MP3 volume
+
+  qtr.setTypeAnalog();         // Set sensors to analog mode
+  qtr.setSensorPins((const uint8_t[]){A0, A1, A2}, 3); // Define sensor pins
+
+  pinMode(IN1L, OUTPUT);       // Set motor pins as output
+  pinMode(IN2L, OUTPUT);
+  pinMode(IN1R, OUTPUT);
+  pinMode(IN2R, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);    // Set LED pin as output
+
+  delay(500);                  // Wait before starting
+
+  playMP3_blocking(7, 3000);   // Play startup sound
+  playMP3_blocking(3, 2000);
+  playMP3_blocking(4, 2000);
+
+  Serial.println("Calibrating..."); // Print calibration message
+  for (int i = 0; i < 200; i++) {   // Calibration loop
+    qtr.calibrate();                // Calibrate sensors
+    delay(5);                       // Small delay
+  }
+
+  playMP3_blocking(5, 2000);  // Play calibration done sound
+  Serial.println("Done!");    // Print done message
+
+  delay(100);                // Wait before ultrasonic purge
+  for (int i = 0; i < 5; i++) { // Clean sensor readings
+    sonar1.ping_cm();           // Read sensor 1
+    sonar2.ping_cm();           // Read sensor 2
+    delay(30);                  // Small delay
+  }
+  delay(200);                 // Final delay
+}
+
+void runServoSequence() {
+  servo1.write(160);         // Move servo 1
+  delay(1500);               // Wait
+
+  servo2.write(80);          // Move servo 2
+  delay(1500);
+
+  servo2.write(20);          // Move servo 2 again
+  delay(1500);
+
+  servo1.write(130);         // Reset servo 1
+  delay(1500);
+}
+
+// --- LED blink based on speed ---
+void updateSpeedLED(int speed) {
+  speed = constrain(abs(speed), 0, maxSpeed); // Normalize speed
+
+  if (speed < 10) {           // If almost stopped
+    digitalWrite(LED_PIN, HIGH); // Keep LED ON
+    return;                   // Exit function
+  }
+
+  blinkInterval = map(speed, 10, maxSpeed, 800, 100); // Adjust blink speed
+
+  if (millis() - ledTimer >= blinkInterval) { // Check timing
+    ledTimer = millis();       // Reset timer
+    ledState = !ledState;      // Toggle LED state
+    digitalWrite(LED_PIN, ledState); // Apply state
+  }
+}
+
+void setMotor(int leftSpeed, int rightSpeed) {
+  leftSpeed = constrain(leftSpeed, -maxSpeed, maxSpeed); // Limit speed
+  rightSpeed = constrain(rightSpeed, -maxSpeed, maxSpeed);
+
+  if (leftSpeed >= 0) {       // Forward left motor
+    analogWrite(IN1L, leftSpeed);
+    analogWrite(IN2L, 0);
+  } else {                    // Reverse left motor
+    analogWrite(IN1L, 0);
+    analogWrite(IN2L, -leftSpeed);
+  }
+
+  if (rightSpeed >= 0) {      // Forward right motor
+    analogWrite(IN1R, 0);
+    analogWrite(IN2R, rightSpeed);
+  } else {                    // Reverse right motor
+    analogWrite(IN1R, -rightSpeed);
+    analogWrite(IN2R, 0);
+  }
+}
+
+void brake() {
+  analogWrite(IN1L, 255);     // Apply brake left motor
+  analogWrite(IN2L, 255);
+  analogWrite(IN1R, 255);     // Apply brake right motor
+  analogWrite(IN2R, 255);
+}
+
+void playMP3_blocking(uint16_t track, unsigned long duration) {
+  mp3.playFileByIndexNumber(track); // Play track
+  delay(duration);                  // Wait until finished
+}
+
+void playMP3_nonBlocking(uint16_t track, unsigned long duration) {
+  if (!mp3Busy || (millis() - mp3Timer > mp3Duration - 100)) { // Check availability
+    mp3.playFileByIndexNumber(track); // Play track
+    currentTrack = track;             // Save track
+    mp3Duration = duration;           // Save duration
+    mp3Timer = millis();              // Start timer
+    mp3Busy = true;                  // Set busy flag
+  }
+}
+
+void updateMP3() {
+  if (mp3Busy && (millis() - mp3Timer >= mp3Duration)) { // Check if done
+    mp3Busy = false;            // Reset flag
+  }
+}
+
+void loop() {
+  updateMP3();                 // Update MP3 state
+
+  unsigned int d1 = sonar1.ping_cm(); // Read distance sensor 1
+  delay(15);                          // Small delay
+  unsigned int d2 = sonar2.ping_cm(); // Read distance sensor 2
+
+  if ((d1 > 0 && d1 <= SEUIL_OBJET) || (d2 > 0 && d2 <= SEUIL_OBJET)) { // Object detected
+    brake();                          // Stop robot
+    Serial.println("Object detected, braking!"); // Debug message
+    delay(50);                        // Short delay
+
+    updateSpeedLED(0);                // Update LED
+
+    if (!audioPlayed) {               // Play sound once
+      playMP3_nonBlocking(8, 2000);
+      audioPlayed = true;
+    }
+
+    return;                           // Skip rest of loop
+  }
+
+  audioPlayed = false;                // Reset audio flag
+
+  qtr.readCalibrated(sensorValues);  // Read line sensors
+
+  bool allWhite =                   // Check if all sensors see white
+    sensorValues[0] < WHITE_THRESHOLD &&
+    sensorValues[1] < WHITE_THRESHOLD &&
+    sensorValues[2] < WHITE_THRESHOLD;
+
+  if (state == BEFORE_TURN && allWhite) { // First white line
+    Serial.println("STOP - First white detected");
+
+    brake();                       // Stop robot
+    updateSpeedLED(0);            // Update LED
+    runServoSequence();           // Run servo animation
+
+    Serial.println("Turning 180 degrees");
+    setMotor(-150, 150);          // Rotate robot
+    delay(turnDelay);             // Wait for turn
+
+    brake();                      // Stop again
+    delay(200);
+
+    integral = 0;                 // Reset PID
+    lastError = 0;
+
+    state = AFTER_TURN;           // Change state
+  }
+  else if (state == AFTER_TURN && allWhite) { // Second white line
+    Serial.println("STOP - Second white detected, finished");
+
+    brake();                      // Stop robot
+    updateSpeedLED(0);
+
+    state = DONE;                 // Final state
+    playMP3_nonBlocking(1, 2000); // Play finish sound
+
+    while (1) {                   // Infinite stop loop
+      updateSpeedLED(0);
+    }
+  }
+
+  if (state != DONE) {            // If still running
+    uint16_t position = qtr.readLineWhite(sensorValues); // Get position
+
+    int error = position - 1000;  // Compute error
+
+    integral += error;            // Update integral
+    int derivative = error - lastError; // Compute derivative
+
+    int correction = Kp * error + Ki * integral + Kd * derivative; // PID
+    lastError = error;            // Save error
+
+    int leftSpeed = baseSpeed + correction;  // Adjust left speed
+    int rightSpeed = baseSpeed - correction; // Adjust right speed
+
+    setMotor(leftSpeed, rightSpeed); // Apply speeds
+
+    int currentSpeed = (abs(leftSpeed) + abs(rightSpeed)) / 2; // Average speed
+    updateSpeedLED(currentSpeed);   // Update LED
+
+    Serial.print("Pos: ");         // Debug output
+    Serial.print(position);
+    Serial.print(" Error: ");
+    Serial.println(error);
+  }
+}
