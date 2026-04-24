@@ -162,11 +162,11 @@ void setMotor(int leftSpeed, int rightSpeed) {
   }
 
   if (rightSpeed >= 0) {      // Forward right motor
-    analogWrite(IN1R, 0);
-    analogWrite(IN2R, rightSpeed);
-  } else {                    // Reverse right motor
-    analogWrite(IN1R, -rightSpeed);
+    analogWrite(IN1R, rightSpeed);
     analogWrite(IN2R, 0);
+  } else {                    // Reverse right motor
+    analogWrite(IN1R, 0);
+    analogWrite(IN2R, -rightSpeed);
   }
 }
 
